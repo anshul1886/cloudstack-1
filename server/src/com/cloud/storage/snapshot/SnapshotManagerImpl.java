@@ -21,6 +21,10 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.TimeZone;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import javax.ejb.Local;
 import javax.inject.Inject;
@@ -49,6 +53,7 @@ import org.apache.cloudstack.engine.subsystem.api.storage.VolumeDataFactory;
 import org.apache.cloudstack.engine.subsystem.api.storage.VolumeInfo;
 import org.apache.cloudstack.engine.subsystem.api.storage.ZoneScope;
 import org.apache.cloudstack.framework.config.dao.ConfigurationDao;
+import org.apache.cloudstack.managed.context.ManagedContextRunnable;
 import org.apache.cloudstack.storage.datastore.db.PrimaryDataStoreDao;
 import org.apache.cloudstack.storage.datastore.db.SnapshotDataStoreDao;
 import org.apache.cloudstack.storage.datastore.db.SnapshotDataStoreVO;
@@ -114,6 +119,7 @@ import com.cloud.utils.NumbersUtil;
 import com.cloud.utils.Pair;
 import com.cloud.utils.Ternary;
 import com.cloud.utils.component.ManagerBase;
+import com.cloud.utils.concurrency.NamedThreadFactory;
 import com.cloud.utils.db.DB;
 import com.cloud.utils.db.Filter;
 import com.cloud.utils.db.JoinBuilder;
@@ -190,6 +196,7 @@ public class SnapshotManagerImpl extends ManagerBase implements SnapshotManager,
 
     private int _totalRetries;
     private int _pauseInterval;
+    protected ExecutorService _executor;
 
     @Override
     public Answer sendToPool(Volume vol, Command cmd) {
@@ -986,19 +993,9 @@ public class SnapshotManagerImpl extends ManagerBase implements SnapshotManager,
             if (snapshotStrategy == null) {
                 throw new CloudRuntimeException("Can't find snapshot strategy to deal with snapshot:" + snapshotId);
             }
-
-            snapshotStrategy.takeSnapshot(snapshot);
-
-            try {
-                postCreateSnapshot(volume.getId(), snapshotId, payload.getSnapshotPolicyId());
-                SnapshotDataStoreVO snapshotStoreRef = _snapshotStoreDao.findBySnapshot(snapshotId, DataStoreRole.Image);
-                UsageEventUtils.publishUsageEvent(EventTypes.EVENT_SNAPSHOT_CREATE, snapshot.getAccountId(), snapshot.getDataCenterId(), snapshotId, snapshot.getName(),
-                    null, null, snapshotStoreRef.getPhysicalSize(), volume.getSize(), snapshot.getClass().getName(), snapshot.getUuid());
-                // Correct the resource count of snapshot in case of delta snapshots.
-                _resourceLimitMgr.decrementResourceCount(snapshotOwner.getId(), ResourceType.secondary_storage, new Long(volume.getSize() - snapshotStoreRef.getPhysicalSize()));
-            } catch (Exception e) {
-                s_logger.debug("post process snapshot failed", e);
-            }
+            snapshot = snapshotStrategy.takeSnapshot(snapshot);
+            snapshot.addPayload(payload);
+            _executor.submit(new BackupSnapshotTask(snapshotStrategy, snapshot));
         } catch (Exception e) {
             s_logger.debug("Failed to create snapshot", e);
             _resourceLimitMgr.decrementResourceCount(snapshotOwner.getId(), ResourceType.snapshot);
@@ -1008,11 +1005,51 @@ public class SnapshotManagerImpl extends ManagerBase implements SnapshotManager,
         return snapshot;
     }
 
+    public void handleBackupSnapshot(SnapshotStrategy snapshotStrategy, SnapshotInfo snapshot) {
+        CreateSnapshotPayload payload = (CreateSnapshotPayload) snapshot.getPayload();
+        DataStore primaryStore = snapshot.getDataStore();
+        SnapshotInfo backupedSnapshot = snapshotStrategy.backupSnapshot(snapshot);
+        try {
+            SnapshotInfo parent = snapshot.getParent();
+            if (backupedSnapshot != null && parent != null) {
+                Long parentSnapshotId = parent.getId();
+                while (parentSnapshotId != null && parentSnapshotId != 0L) {
+                    SnapshotDataStoreVO snapshotDataStoreVO = _snapshotStoreDao.findByStoreSnapshot(primaryStore.getRole(), primaryStore.getId(), parentSnapshotId);
+                    if (snapshotDataStoreVO != null) {
+                        parentSnapshotId = snapshotDataStoreVO.getParentSnapshotId();
+                        _snapshotStoreDao.remove(snapshotDataStoreVO.getId());
+                    } else {
+                        parentSnapshotId = null;
+                    }
+                }
+                SnapshotDataStoreVO snapshotDataStoreVO = _snapshotStoreDao.findByStoreSnapshot(primaryStore.getRole(), primaryStore.getId(), snapshot.getId());
+                if (snapshotDataStoreVO != null) {
+                    snapshotDataStoreVO.setParentSnapshotId(0L);
+                    _snapshotStoreDao.update(snapshotDataStoreVO.getId(), snapshotDataStoreVO);
+                }
+            }
+        } catch (Exception e) {
+            s_logger.debug("Failed to clean up snapshots on primary storage", e);
+        }
+        try {
+            long snapshotId = snapshot.getId();
+            VolumeVO volume = _volsDao.findById(snapshot.getVolumeId());
+            postCreateSnapshot(volume.getId(), snapshotId, payload.getSnapshotPolicyId());
+            SnapshotDataStoreVO snapshotStoreRef = _snapshotStoreDao.findBySnapshot(snapshotId, DataStoreRole.Image);
+            UsageEventUtils.publishUsageEvent(EventTypes.EVENT_SNAPSHOT_CREATE, snapshot.getAccountId(), snapshot.getDataCenterId(), snapshotId, snapshot.getName(),
+                null, null, snapshotStoreRef.getPhysicalSize(), volume.getSize(), snapshot.getClass().getName(), snapshot.getUuid());
+            // Correct the resource count of snapshot in case of delta snapshots.
+            _resourceLimitMgr.decrementResourceCount(payload.getAccount().getId(), ResourceType.secondary_storage, new Long(volume.getSize() - snapshotStoreRef.getPhysicalSize()));
+        } catch (Exception e) {
+            s_logger.debug("post process snapshot failed", e);
+        }
+    }
+
     @Override
     public boolean configure(String name, Map<String, Object> params) throws ConfigurationException {
 
         String value = _configDao.getValue(Config.BackupSnapshotWait.toString());
-
+        _executor = new ThreadPoolExecutor(10, 100, 60l, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(), new NamedThreadFactory("BackupSnapshotTaskPool"));
         Type.HOURLY.setMax(NumbersUtil.parseInt(_configDao.getValue("snapshot.max.hourly"), HOURLYMAX));
         Type.DAILY.setMax(NumbersUtil.parseInt(_configDao.getValue("snapshot.max.daily"), DAILYMAX));
         Type.WEEKLY.setMax(NumbersUtil.parseInt(_configDao.getValue("snapshot.max.weekly"), WEEKLYMAX));
@@ -1155,6 +1192,23 @@ public class SnapshotManagerImpl extends ManagerBase implements SnapshotManager,
         return snapshot;
     }
 
+    protected class BackupSnapshotTask extends ManagedContextRunnable {
+        SnapshotStrategy _snapshotStrategy;
+        SnapshotInfo _snapshot;
 
+        BackupSnapshotTask(SnapshotStrategy snapshotStrategy, SnapshotInfo snapshot) {
+            _snapshotStrategy = snapshotStrategy;
+            _snapshot = snapshot;
+        }
+
+        @Override
+        protected void runInContext() {
+            try {
+                handleBackupSnapshot(_snapshotStrategy, _snapshot);
+            } catch (final Exception e) {
+                s_logger.error("Exception caught during snapshot backup: ", e);
+            }
+        }
+    }
 
 }
